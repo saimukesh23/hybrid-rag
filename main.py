@@ -134,9 +134,10 @@ def build_config(nvidia_key: str, groq_key: str, db_url: str):
 # ─── Document processing ─────────────────────────────────────────────────────
 
 def process_document(file_path: str, config) -> bool:
+   def process_document(file_path: str, config) -> bool:
     try:
-        from raglite import insert_document
-        insert_document(Path(file_path), config=config)
+        from raglite import ingest
+        ingest(Path(file_path), config=config)
         return True
     except Exception as e:
         logger.error(f"Document insert error: {e}")
