@@ -1,0 +1,30 @@
+# Core RAG
+raglite==0.2.1
+rerankers==0.6.0
+
+# LLM / AI providers
+groq>=0.9.0
+anthropic>=0.30.0        # kept in case raglite internals reference it
+
+# Embeddings & ML
+spacy>=3.7.0
+
+# Database
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+
+# HTTP / API helpers
+requests>=2.31.0
+httpx>=0.27.0
+
+# PDF parsing
+pypdf>=3.0.0
+
+# Pydantic
+pydantic==2.10.1
+
+# Env & config
+python-dotenv>=1.0.0
+
+# Frontend
+streamlit>=1.35.0
