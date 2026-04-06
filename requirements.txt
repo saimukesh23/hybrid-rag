@@ -1,28 +1,8 @@
-# Core RAG
-raglite==0.2.1
-rerankers==0.6.0
-
-# LLM
+raglite>=1.0.0
+rerankers>=0.6.0
 groq>=0.9.0
-
-# NLP
-spacy==3.7.5
-
-# Database
-sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.9
-
-# API calls
 requests>=2.31.0
-
-# PDF
-pypdf>=3.0.0
-
-# Config
 python-dotenv>=1.0.0
-
-# Frontend
 streamlit>=1.35.0
-
-# REQUIRED spaCy model
-https://github.com/explosion/spacy-models/releases/download/xx_sent_ud_sm-3.7.0/xx_sent_ud_sm-3.7.0-py3-none-any.whl
+duckdb>=0.10.0
