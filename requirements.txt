@@ -1,5 +1,4 @@
 raglite==1.0.0
-rerankers>=0.10.0
 groq>=0.9.0
 psycopg2-binary>=2.9.9
 requests>=2.31.0
