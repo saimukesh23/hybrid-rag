@@ -1,8 +1,20 @@
-raglite>=1.0.0
-rerankers>=0.6.0
+# Pin exact version — raglite renames public API between releases
+raglite==1.0.0
+
+# Reranker library (raglite dependency, but pin for stability)
+rerankers==0.6.0
+
+# LLM
 groq>=0.9.0
+
+# PostgreSQL driver (for Neon)
 psycopg2-binary>=2.9.9
+
+# HTTP calls to NVIDIA API
 requests>=2.31.0
+
+# Env
 python-dotenv>=1.0.0
+
+# UI
 streamlit>=1.35.0
-duckdb>=0.10.0
