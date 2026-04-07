@@ -1,88 +1,30 @@
-"""
-RAG App with Hybrid Search (FINAL WORKING VERSION)
-
-- Embeddings : NVIDIA (direct API, no LiteLLM)
-- Reranking  : NVIDIA rerank API
-- LLM        : Groq llama3-70b-8192
-- Database   : PostgreSQL (Neon) or DuckDB fallback
-- RAGLite    : 1.0.0 (stable API)
-"""
-
 import os
 import logging
-import tempfile
-import warnings
-from pathlib import Path
-from typing import List
-
 import streamlit as st
-from dotenv import load_dotenv
+from raglite import RAGLiteConfig, insert_document, hybrid_search, retrieve_chunks, rerank_chunks, rag
+from typing import List
+from pathlib import Path
+import time
+import warnings
 
-load_dotenv()
-warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# ─────────────────────────────────────────────────────────
+warnings.filterwarnings("ignore", message=".*torch.classes.*")
 
 RAG_SYSTEM_PROMPT = """
-You are a helpful assistant. Answer ONLY using the provided context.
-Do not mention context explicitly.
+You are a friendly and knowledgeable assistant that provides complete and insightful answers.
+Answer the user's question using only the context below.
+When responding, you MUST NOT reference the existence of the context, directly or indirectly.
+Instead, you MUST treat the context as if its contents are entirely part of your working memory.
 """.strip()
 
-# ─────────────────────────────────────────────────────────
-# Secrets
-
-def get_secret(key: str, default: str = "") -> str:
-    try:
-        return st.secrets[key]
-    except Exception:
-        return os.getenv(key, default)
-
-
-def get_db_url():
-    url = get_secret("DATABASE_URL")
-    if not url:
-        return "duckdb:///raglite.duckdb"
-
-    if url.startswith("postgresql") and "sslmode" not in url:
-        url += "?sslmode=require"
-
-    return url
-
-# ─────────────────────────────────────────────────────────
-# NVIDIA EMBEDDINGS (FIXED)
-
-def nvidia_embed(texts: List[str], api_key: str):
-    import requests
-
-    resp = requests.post(
-        "https://integrate.api.nvidia.com/v1/embeddings",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "nvidia/llama-3.2-nv-embedqa-1b-v2",
-            "input": texts,
-            "input_type": "passage",
-        },
-        timeout=60,
-    )
-
-    resp.raise_for_status()
-    return [x["embedding"] for x in resp.json()["data"]]
-
-# ─────────────────────────────────────────────────────────
-# NVIDIA RERANKER
-
+# ✅ NEW: NVIDIA RERANKER (replaces Cohere)
 class NvidiaReranker:
-    def __init__(self, api_key):
+    def __init__(self, api_key: str):
         self.api_key = api_key
 
-    def rank(self, query, docs, **kwargs):
+    def rank(self, query: str, docs: List[str], **kwargs):
         import requests
-
         resp = requests.post(
             "https://integrate.api.nvidia.com/v1/ranking",
             headers={
@@ -90,179 +32,180 @@ class NvidiaReranker:
                 "Content-Type": "application/json",
             },
             json={
-                "model": "nvidia/llama-3.2-nv-rerankqa-1b-v2",
+                "model": "rerank-qa-mistral-4b",
                 "query": {"role": "user", "content": query},
                 "passages": [{"role": "user", "content": d} for d in docs],
             },
             timeout=60,
         )
-
         resp.raise_for_status()
-        rankings = resp.json()["rankings"]
+        rankings = resp.json().get("rankings", [])
+        return [r["index"] for r in sorted(rankings, key=lambda x: x.get("logit", 0), reverse=True)]
 
-        return [
-            r["index"]
-            for r in sorted(rankings, key=lambda x: x["logit"], reverse=True)
-        ]
+# ✅ NEW: NVIDIA EMBEDDINGS (replaces OpenAI)
+def nvidia_embed(texts: List[str], api_key: str) -> List[List[float]]:
+    import requests
+    resp = requests.post(
+        "https://integrate.api.nvidia.com/v1/embeddings",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "nv-embed-v1",
+            "input": texts,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return [item["embedding"] for item in resp.json()["data"]]
 
-# ─────────────────────────────────────────────────────────
-# GROQ LLM
-
-def groq_chat(system, user, key):
+# ✅ NEW: GROQ (replaces Claude)
+def groq_chat(prompt: str, system_prompt: str, groq_key: str) -> str:
     from groq import Groq
-
-    client = Groq(api_key=key)
-
-    resp = client.chat.completions.create(
+    client = Groq(api_key=groq_key)
+    completion = client.chat.completions.create(
         model="llama3-70b-8192",
         messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
         ],
-        temperature=0.7,
         max_tokens=1024,
+        temperature=0.7,
     )
+    return completion.choices[0].message.content
 
-    return resp.choices[0].message.content
 
-# ─────────────────────────────────────────────────────────
-# RAG CONFIG
-
-def build_config(nvidia_key, groq_key, db_url):
-    from raglite import RAGLiteConfig
-
-    os.environ["GROQ_API_KEY"] = groq_key
-
-    def embedder(texts):
-        return nvidia_embed(texts, nvidia_key)
-
-    return RAGLiteConfig(
-        db_url=db_url,
-        llm="groq/llama3-70b-8192",
-        embedder=embedder,   # ✅ FIXED
-        embedder_normalize=True,
-        reranker=NvidiaReranker(nvidia_key),
-    )
-
-# ─────────────────────────────────────────────────────────
-# DOCUMENT INGESTION
-
-def process_document(file_path, config):
+def initialize_config(nvidia_embed_key: str, groq_key: str, nvidia_rerank_key: str, db_url: str) -> RAGLiteConfig:
     try:
-        from raglite import Document, insert_documents
+        os.environ["NVIDIA_API_KEY"] = nvidia_embed_key
+        os.environ["GROQ_API_KEY"] = groq_key
 
-        doc = Document.from_path(Path(file_path))
-        insert_documents([doc], config=config)
-        return True
+        def embedder_fn(texts: List[str]):
+            return nvidia_embed(texts, nvidia_embed_key)
 
+        return RAGLiteConfig(
+            db_url=db_url,
+            llm="groq/llama3-70b-8192",  # ✅ changed from Claude
+            embedder=embedder_fn,        # ✅ changed from OpenAI
+            embedder_normalize=True,
+            chunk_max_size=2000,
+            embedder_sentence_window_size=2,
+            reranker=NvidiaReranker(api_key=nvidia_rerank_key)  # ✅ changed from Cohere
+        )
     except Exception as e:
-        logger.error(f"INSERT ERROR: {e}", exc_info=True)
+        raise ValueError(f"Configuration error: {e}")
+
+
+def process_document(file_path: str) -> bool:
+    try:
+        if not st.session_state.get('my_config'):
+            raise ValueError("Configuration not initialized")
+        insert_document(Path(file_path), config=st.session_state.my_config)
+        return True
+    except Exception as e:
+        logger.error(f"Error processing document: {str(e)}")
         return False
 
-# ─────────────────────────────────────────────────────────
-# SEARCH PIPELINE
 
-def search_and_rerank(query, config):
+def perform_search(query: str) -> List[dict]:
     try:
-        from raglite import hybrid_search, rerank_chunks, retrieve_context
-
-        chunk_ids, _ = hybrid_search(query, num_results=20, config=config)
-
+        chunk_ids, scores = hybrid_search(query, num_results=10, config=st.session_state.my_config)
         if not chunk_ids:
             return []
-
-        ranked = rerank_chunks(query, chunk_ids, config=config)
-        return retrieve_context(ranked[:5], config=config)
-
+        chunks = retrieve_chunks(chunk_ids, config=st.session_state.my_config)
+        return rerank_chunks(query, chunks, config=st.session_state.my_config)
     except Exception as e:
-        logger.error(f"SEARCH ERROR: {e}", exc_info=True)
+        logger.error(f"Search error: {str(e)}")
         return []
 
-# ─────────────────────────────────────────────────────────
-# ANSWER GENERATION
 
-def generate_answer(query, spans, history, groq_key):
-    context_parts = []
-
-    for span in spans:
-        text = " ".join(
-            getattr(c, "text", "") for c in (span if isinstance(span, list) else [span])
+# ✅ UPDATED fallback (Claude → Groq)
+def handle_fallback(query: str) -> str:
+    try:
+        return groq_chat(
+            prompt=query,
+            system_prompt="You are a helpful AI assistant. Give clear answers.",
+            groq_key=st.session_state.user_env["GROQ_API_KEY"]
         )
-        context_parts.append(text)
+    except Exception as e:
+        logger.error(f"Fallback error: {str(e)}")
+        return "Error occurred."
 
-    context = "\n\n---\n\n".join(context_parts)
-
-    system = f"{RAG_SYSTEM_PROMPT}\n\nContext:\n{context}"
-
-    hist = ""
-    for u, a in history[-4:]:
-        hist += f"User: {u}\nAssistant: {a}\n"
-
-    return groq_chat(system, hist + f"\nUser: {query}", groq_key)
-
-
-def fallback_answer(query, key):
-    return groq_chat("You are helpful.", query, key)
-
-# ─────────────────────────────────────────────────────────
-# STREAMLIT UI
 
 def main():
-    st.set_page_config(page_title="RAG App", layout="wide")
+    st.set_page_config(page_title="LLM-Powered Hybrid Search-RAG Assistant", layout="wide")
 
-    if "config" not in st.session_state:
-        st.session_state.config = None
-    if "history" not in st.session_state:
-        st.session_state.history = []
-    if "ready" not in st.session_state:
-        st.session_state.ready = False
+    for state_var in ['chat_history', 'documents_loaded', 'my_config', 'user_env']:
+        if state_var not in st.session_state:
+            st.session_state[state_var] = [] if state_var == 'chat_history' else False if state_var == 'documents_loaded' else None if state_var == 'my_config' else {}
 
-    # Sidebar
     with st.sidebar:
-        st.title("⚙️ Setup")
+        st.title("Configuration")
 
-        nvidia = get_secret("NVIDIA_API_KEY")
-        groq   = get_secret("GROQ_API_KEY")
-        db     = get_db_url()
+        # ✅ UPDATED INPUTS
+        nvidia_embed_key = st.text_input("NVIDIA Embed API Key", type="password")
+        groq_key = st.text_input("Groq API Key", type="password")
+        nvidia_rerank_key = st.text_input("NVIDIA Rerank API Key", type="password")
+        db_url = st.text_input("Database URL", value="sqlite:///raglite.sqlite")
 
-        if st.button("Initialize"):
-            st.session_state.config = build_config(nvidia, groq, db)
-            st.session_state.ready = True
-            st.success("Ready!")
+        if st.button("Save Configuration"):
+            try:
+                if not all([nvidia_embed_key, groq_key, nvidia_rerank_key, db_url]):
+                    st.error("All fields are required!")
+                    return
 
-    st.title("📄 RAG Chat")
+                st.session_state.my_config = initialize_config(
+                    nvidia_embed_key,
+                    groq_key,
+                    nvidia_rerank_key,
+                    db_url
+                )
 
-    if not st.session_state.ready:
-        st.info("Initialize from sidebar")
-        return
+                st.session_state.user_env = {"GROQ_API_KEY": groq_key}
+                st.success("Configuration saved successfully!")
+            except Exception as e:
+                st.error(f"Configuration error: {str(e)}")
 
-    files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+    st.title("👀 RAG App with Hybrid Search")
 
-    if files:
-        for f in files:
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(f.read())
-                path = tmp.name
+    if st.session_state.my_config:
+        uploaded_files = st.file_uploader("Upload PDF documents", type=["pdf"], accept_multiple_files=True)
 
-            if process_document(path, st.session_state.config):
-                st.success(f"{f.name} processed")
-            else:
-                st.error(f"{f.name} failed")
+        if uploaded_files:
+            success = False
+            for uploaded_file in uploaded_files:
+                temp_path = f"temp_{uploaded_file.name}"
+                with open(temp_path, "wb") as f:
+                    f.write(uploaded_file.getvalue())
 
-    query = st.chat_input("Ask something")
+                if process_document(temp_path):
+                    st.success(f"Successfully processed: {uploaded_file.name}")
+                    success = True
+                else:
+                    st.error(f"Failed to process: {uploaded_file.name}")
 
-    if query:
-        st.chat_message("user").write(query)
+                os.remove(temp_path)
 
-        chunks = search_and_rerank(query, st.session_state.config)
+            if success:
+                st.session_state.documents_loaded = True
 
-        if chunks:
-            ans = generate_answer(query, chunks, st.session_state.history, get_secret("GROQ_API_KEY"))
-        else:
-            ans = fallback_answer(query, get_secret("GROQ_API_KEY"))
-
-        st.chat_message("assistant").write(ans)
-        st.session_state.history.append((query, ans))
+    if st.session_state.documents_loaded:
+        user_input = st.chat_input("Ask a question...")
+        if user_input:
+            with st.chat_message("assistant"):
+                reranked_chunks = perform_search(user_input)
+                if not reranked_chunks:
+                    response = handle_fallback(user_input)
+                else:
+                    response = rag(
+                        prompt=user_input,
+                        system_prompt=RAG_SYSTEM_PROMPT,
+                        search=hybrid_search,
+                        max_contexts=5,
+                        config=st.session_state.my_config
+                    )
+                st.write(response)
 
 
 if __name__ == "__main__":
