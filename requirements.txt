@@ -2,15 +2,8 @@ raglite==0.2.1
 pydantic==2.10.1
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.9
-
-# Removed openai, cohere, anthropic
-
 pypdf>=3.0.0
 python-dotenv>=1.0.0
-rerankers==0.6.0
-
-# Removed spacy
-
-streamlit
-requests>=2.31.0   # REQUIRED for NVIDIA API calls
-groq>=0.9.0        # REQUIRED for Groq LLM
+streamlit>=1.25.0
+requests>=2.31.0
+groq>=0.9.0
