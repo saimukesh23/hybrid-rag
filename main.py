@@ -1,9 +1,10 @@
 """
 RAG App with Hybrid Search
 - Embeddings : NVIDIA llama-3.2-nv-embedqa-1b-v2  (via LiteLLM openai/ prefix)
-- Reranking  : NVIDIA llama-3.2-nv-rerankqa-1b-v2 (direct HTTP, custom wrapper)
+- Reranking  : NVIDIA llama-3.2-nv-rerankqa-1b-v2 (direct HTTP wrapper)
 - LLM        : Groq  llama3-70b-8192
 - Database   : PostgreSQL (Neon) or DuckDB (local fallback)
+- RAGLite    : pinned to 1.0.0 — uses Document / insert_documents API
 """
 
 import os
@@ -48,12 +49,12 @@ def get_db_url() -> str:
         url = f"{url}{sep}sslmode=require"
     return url
 
-# ─── NVIDIA Reranker (direct HTTP — not via LiteLLM) ─────────────────────────
+# ─── NVIDIA Reranker ─────────────────────────────────────────────────────────
 
 class NvidiaReranker:
     """
-    Minimal reranker object that RAGLite accepts.
-    RAGLite calls  reranker.rank(query, docs) -> ranked list of indices.
+    RAGLite calls reranker.rank(query, docs) where docs is a list[str].
+    We return a list of original indices sorted by relevance (most relevant first).
     """
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -75,15 +76,13 @@ class NvidiaReranker:
         )
         resp.raise_for_status()
         rankings = resp.json().get("rankings", [])
-        # Return indices sorted by descending logit (most relevant first)
         return [r["index"] for r in sorted(rankings, key=lambda x: x.get("logit", 0), reverse=True)]
 
-# ─── Groq chat ───────────────────────────────────────────────────────────────
+# ─── Groq LLM ────────────────────────────────────────────────────────────────
 
 def groq_chat(system: str, user: str, groq_key: str) -> str:
     from groq import Groq
-    client = Groq(api_key=groq_key)
-    resp = client.chat.completions.create(
+    resp = Groq(api_key=groq_key).chat.completions.create(
         model="llama3-70b-8192",
         messages=[{"role": "system", "content": system},
                   {"role": "user",   "content": user}],
@@ -97,58 +96,64 @@ def groq_chat(system: str, user: str, groq_key: str) -> str:
 def build_config(nvidia_key: str, groq_key: str, db_url: str):
     from raglite import RAGLiteConfig
 
-    # LiteLLM uses OPENAI_API_KEY + api_base for openai-compatible endpoints.
-    # Setting NVIDIA_API_KEY and pointing LiteLLM to the NVIDIA base URL works
-    # via the "openai/" model prefix (LiteLLM's generic OpenAI-compat gateway).
     os.environ["GROQ_API_KEY"]   = groq_key
     os.environ["NVIDIA_API_KEY"] = nvidia_key
-    # LiteLLM needs these to route to NVIDIA for embeddings
-    os.environ["OPENAI_API_KEY"]  = nvidia_key   # used by litellm openai/ prefix
+    # LiteLLM routes "openai/<model>" to OPENAI_BASE_URL using OPENAI_API_KEY
+    os.environ["OPENAI_API_KEY"]  = nvidia_key
     os.environ["OPENAI_BASE_URL"] = "https://integrate.api.nvidia.com/v1"
 
     return RAGLiteConfig(
         db_url=db_url,
-        # LLM: Groq via LiteLLM's groq/ prefix
         llm="groq/llama3-70b-8192",
-        # Embedder: NVIDIA via LiteLLM's openai/ prefix pointing at NVIDIA base URL
-        # The model string must be the exact model name as NVIDIA serves it.
         embedder="openai/nvidia/llama-3.2-nv-embedqa-1b-v2",
         embedder_normalize=True,
         reranker=NvidiaReranker(api_key=nvidia_key),
     )
 
-# ─── Document processing ─────────────────────────────────────────────────────
+# ─── Document ingestion (raglite 1.0.0 API) ──────────────────────────────────
 
 def process_document(file_path: str, config) -> bool:
     try:
-        from raglite import insert_document
-        insert_document(Path(file_path), config=config)
+        from raglite import Document, insert_documents
+        doc = Document.from_path(Path(file_path))
+        insert_documents([doc], config=config)
         return True
     except Exception as e:
-        logger.error(f"insert_document error: {e}", exc_info=True)
+        logger.error(f"insert_documents error: {e}", exc_info=True)
         return False
 
-# ─── Search & rerank ─────────────────────────────────────────────────────────
+# ─── Search → rerank → retrieve (raglite 1.0.0 API) ─────────────────────────
 
 def search_and_rerank(query: str, config) -> List:
+    """
+    Returns a list of chunk spans (each is a list of consecutive Chunk objects).
+    Falls back to [] on error.
+    """
     try:
-        from raglite import hybrid_search, rerank_chunks
+        from raglite import hybrid_search, rerank_chunks, retrieve_context
         chunk_ids, _ = hybrid_search(query, num_results=20, config=config)
         if not chunk_ids:
             return []
-        return rerank_chunks(query, chunk_ids, config=config)
+        ranked_chunks = rerank_chunks(query, chunk_ids, config=config)
+        # retrieve_context groups top chunks into coherent spans
+        return retrieve_context(ranked_chunks[:5], config=config)
     except Exception as e:
         logger.error(f"search_and_rerank error: {e}", exc_info=True)
         return []
 
 # ─── Answer generation ───────────────────────────────────────────────────────
 
-def generate_answer(query: str, chunks: List, history: List, groq_key: str) -> str:
+def generate_answer(query: str, chunk_spans: List, history: List, groq_key: str) -> str:
     parts = []
-    for chunk in chunks[:5]:
-        text = getattr(chunk, "text", None) or getattr(chunk, "content", str(chunk))
-        if text:
-            parts.append(text.strip())
+    for span in chunk_spans:
+        # Each span is a list of Chunk objects; concatenate their text
+        span_text = " ".join(
+            getattr(c, "text", None) or getattr(c, "content", str(c))
+            for c in (span if isinstance(span, list) else [span])
+        ).strip()
+        if span_text:
+            parts.append(span_text)
+
     context = "\n\n---\n\n".join(parts)
     system  = f"{RAG_SYSTEM_PROMPT}\n\nContext:\n{context}"
     hist    = "".join(f"User: {u}\nAssistant: {a}\n\n" for u, a in history[-4:])
@@ -235,7 +240,7 @@ def main():
                         st.success(f"✅ {uf.name}")
                         st.session_state.documents_loaded = True
                     else:
-                        st.error(f"❌ Failed: {uf.name} — check logs for details")
+                        st.error(f"❌ Failed: {uf.name} — check Streamlit logs for details")
                 except Exception as e:
                     st.error(f"❌ {uf.name}: {e}")
                     logger.exception(f"Upload error: {uf.name}")
@@ -268,11 +273,13 @@ def main():
         placeholder = st.empty()
         with st.spinner("Thinking…"):
             try:
-                groq_key = st.session_state.groq_key or get_secret("GROQ_API_KEY")
-                chunks   = search_and_rerank(user_input, st.session_state.my_config)
-                if chunks:
-                    response = generate_answer(user_input, chunks,
-                                               st.session_state.chat_history, groq_key)
+                groq_key   = st.session_state.groq_key or get_secret("GROQ_API_KEY")
+                chunk_spans = search_and_rerank(user_input, st.session_state.my_config)
+                if chunk_spans:
+                    response = generate_answer(
+                        user_input, chunk_spans,
+                        st.session_state.chat_history, groq_key,
+                    )
                 else:
                     st.info("No relevant document context found — using general knowledge.")
                     response = fallback_answer(user_input, groq_key)
