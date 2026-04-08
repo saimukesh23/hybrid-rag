@@ -1,18 +1,7 @@
-# raglite 1.0.0 requires rerankers>=0.10.0 — do NOT pin rerankers separately
 raglite==1.0.0
- 
-# LLM
 groq>=0.9.0
- 
-# PostgreSQL driver (for Neon)
 psycopg2-binary>=2.9.9
- 
-# HTTP calls to NVIDIA API
 requests>=2.31.0
- 
-# Env
 python-dotenv>=1.0.0
- 
-# UI
 streamlit>=1.35.0
- 
+duckdb>=0.10.0
