@@ -1,7 +1,8 @@
-raglite[pandoc]==1.0.0
+raglite==1.0.0
 groq>=0.9.0
 psycopg2-binary>=2.9.9
 requests>=2.31.0
 python-dotenv>=1.0.0
 streamlit>=1.35.0
 duckdb>=0.10.0
+pypdf>=3.0.0
