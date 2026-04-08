@@ -71,7 +71,7 @@ def groq_chat(system: str, user: str, groq_key: str) -> str:
     from groq import Groq
     try:
         resp = Groq(api_key=groq_key).chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",  # ✅ FIXED
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
@@ -94,8 +94,8 @@ def build_config(nvidia_key: str, groq_key: str, db_url: str):
 
     return RAGLiteConfig(
         db_url=db_url,
-        llm="groq/llama3-70b-8192",
-        embedder="openai/nvidia/llama-3.2-nv-embedqa-1b-v2",
+        llm="groq/llama-3.3-70b-versatile",  # ✅ FIXED
+        embedder="nvidia/llama-3.2-nv-embedqa-1b-v2",  # ✅ FIXED
         embedder_normalize=True,
         reranker=NvidiaReranker(api_key=nvidia_key),
     )
@@ -161,6 +161,7 @@ def main():
             st.error("Keys required")
         else:
             st.session_state.config = build_config(nvidia, groq, db)
+            st.session_state.groq_key = groq
             st.success("Ready")
 
     if not st.session_state.config:
@@ -188,14 +189,19 @@ def main():
     q = st.chat_input("Ask...")
     if q:
         st.chat_message("user").write(q)
+
+        groq_key = st.session_state.get("groq_key", groq)
+
         spans = search_and_rerank(q, st.session_state.config)
+
         if spans:
-            ans = generate_answer(q, spans, st.session_state.chat, groq)
+            ans = generate_answer(q, spans, st.session_state.chat, groq_key)
         else:
-            ans = fallback_answer(q, groq)
+            ans = fallback_answer(q, groq_key)
 
         st.chat_message("assistant").write(ans)
         st.session_state.chat.append((q, ans))
+
 
 if __name__ == "__main__":
     main()
