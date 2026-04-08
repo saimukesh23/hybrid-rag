@@ -13,9 +13,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 RAG_SYSTEM_PROMPT = """
-You are a friendly and knowledgeable assistant.
-Answer ONLY using the provided context.
-Do not make up information.
+You are a helpful assistant.
+Answer ONLY using the given context.
+Do not hallucinate.
 """.strip()
 
 # ─── Secrets ─────────────────────────
@@ -92,7 +92,7 @@ def build_config(nvidia_key, groq_key, db_url):
         reranker=NvidiaReranker(nvidia_key),
     )
 
-# ─── FIXED PDF PROCESSING ─────────────────
+# ─── PDF PROCESSING (FINAL FIX) ─────────────────
 
 def process_document(file_path, config):
     try:
@@ -109,7 +109,9 @@ def process_document(file_path, config):
             logger.error("No text extracted")
             return False
 
-        doc = Document(text=text)
+        # ✅ FINAL FIX HERE
+        doc = Document(content=text)
+
         insert_documents([doc], config=config)
 
         return True
@@ -134,7 +136,7 @@ def search_and_rerank(query, config):
 
 # ─── ANSWER ─────────────────────────
 
-def generate_answer(query, spans, history, groq_key):
+def generate_answer(query, spans, groq_key):
     context = "\n".join(
         " ".join(getattr(c, "text", str(c)) for c in span)
         for span in spans
@@ -204,14 +206,15 @@ def main():
         st.write("DEBUG spans:", spans)
 
         if spans:
-            st.success("RAG Answer")
-            ans = generate_answer(q, spans, st.session_state.chat, st.session_state.groq)
+            st.success("✅ RAG Answer")
+            ans = generate_answer(q, spans, st.session_state.groq)
         else:
-            st.warning("Fallback (Groq)")
+            st.warning("⚠️ Groq Fallback")
             ans = fallback_answer(q, st.session_state.groq)
 
         st.chat_message("assistant").write(ans)
         st.session_state.chat.append((q, ans))
+
 
 if __name__ == "__main__":
     main()
