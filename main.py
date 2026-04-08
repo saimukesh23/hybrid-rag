@@ -9,6 +9,14 @@ import anthropic
 import time
 import warnings
 
+import spacy
+
+try:
+    spacy.load("xx_sent_ud_sm")
+except:
+    import os
+    os.system("python -m spacy download xx_sent_ud_sm")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", message=".*torch.classes.*")
