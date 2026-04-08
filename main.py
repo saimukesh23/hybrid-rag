@@ -2,7 +2,6 @@ import os
 import logging
 import tempfile
 import warnings
-from pathlib import Path
 from typing import List
 
 import streamlit as st
@@ -14,12 +13,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 RAG_SYSTEM_PROMPT = """
-You are a friendly and knowledgeable assistant that provides complete and insightful answers.
-Answer the user's question using only the context below.
-Do not mention the context explicitly.
+You are a friendly and knowledgeable assistant.
+Answer ONLY using the provided context.
+Do not make up information.
 """.strip()
 
-# ─── Secrets ─────────────────────────────────────────
+# ─── Secrets ─────────────────────────
 
 def get_secret(key: str, default: str = "") -> str:
     try:
@@ -27,16 +26,11 @@ def get_secret(key: str, default: str = "") -> str:
     except Exception:
         return os.getenv(key, default)
 
-def get_db_url() -> str:
+def get_db_url():
     url = get_secret("DATABASE_URL")
-    if not url:
-        return "duckdb:///raglite.duckdb"
-    if url.startswith("postgresql") and "sslmode" not in url:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}sslmode=require"
-    return url
+    return url if url else "duckdb:///raglite.duckdb"
 
-# ─── NVIDIA Reranker ─────────────────────────────────
+# ─── NVIDIA Reranker ─────────────────
 
 class NvidiaReranker:
     def __init__(self, api_key: str):
@@ -65,7 +59,7 @@ class NvidiaReranker:
             logger.error(f"Reranker error: {e}")
             return list(range(len(docs)))
 
-# ─── Groq LLM ───────────────────────────────────────
+# ─── Groq LLM ───────────────────────
 
 def groq_chat(system: str, user: str, groq_key: str) -> str:
     from groq import Groq
@@ -76,17 +70,15 @@ def groq_chat(system: str, user: str, groq_key: str) -> str:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
             ],
-            max_tokens=1024,
-            temperature=0.7,
         )
         return resp.choices[0].message.content
     except Exception as e:
         logger.error(f"Groq error: {e}")
         return "Error generating response."
 
-# ─── RAG Config ─────────────────────────────────────
+# ─── RAG Config ─────────────────────
 
-def build_config(nvidia_key: str, groq_key: str, db_url: str):
+def build_config(nvidia_key, groq_key, db_url):
     from raglite import RAGLiteConfig
 
     os.environ["OPENAI_API_KEY"] = nvidia_key
@@ -97,27 +89,41 @@ def build_config(nvidia_key: str, groq_key: str, db_url: str):
         llm="groq/llama-3.3-70b-versatile",
         embedder="nvidia/llama-3.2-nv-embedqa-1b-v2",
         embedder_normalize=True,
-        reranker=NvidiaReranker(api_key=nvidia_key),
+        reranker=NvidiaReranker(nvidia_key),
     )
 
-# ─── Document Processing ─────────────────────────────
+# ─── FIXED PDF PROCESSING ─────────────────
 
-def process_document(file_path: str, config) -> bool:
+def process_document(file_path, config):
     try:
-        from raglite import Document, insert_documents
-        doc = Document.from_path(Path(file_path))
+        from raglite import insert_documents, Document
+        from pypdf import PdfReader
+
+        reader = PdfReader(file_path)
+        text = ""
+
+        for page in reader.pages:
+            text += page.extract_text() or ""
+
+        if not text.strip():
+            logger.error("No text extracted")
+            return False
+
+        doc = Document(text=text)
         insert_documents([doc], config=config)
+
         return True
+
     except Exception as e:
         logger.error(f"Document error: {e}")
         return False
 
-# ─── Search ─────────────────────────────────────────
+# ─── SEARCH ─────────────────────────
 
-def search_and_rerank(query: str, config):
+def search_and_rerank(query, config):
     try:
         from raglite import hybrid_search, rerank_chunks, retrieve_context
-        chunk_ids, _ = hybrid_search(query, num_results=20, config=config)
+        chunk_ids, _ = hybrid_search(query, config=config)
         if not chunk_ids:
             return []
         ranked = rerank_chunks(query, chunk_ids, config=config)
@@ -126,21 +132,20 @@ def search_and_rerank(query: str, config):
         logger.error(f"Search error: {e}")
         return []
 
-# ─── Answer ─────────────────────────────────────────
+# ─── ANSWER ─────────────────────────
 
 def generate_answer(query, spans, history, groq_key):
-    context = "\n\n---\n\n".join(
+    context = "\n".join(
         " ".join(getattr(c, "text", str(c)) for c in span)
         for span in spans
     )
     system = f"{RAG_SYSTEM_PROMPT}\n\nContext:\n{context}"
-    hist = "".join(f"User:{u}\nAssistant:{a}\n" for u, a in history[-4:])
-    return groq_chat(system, hist + query, groq_key)
+    return groq_chat(system, query, groq_key)
 
 def fallback_answer(query, groq_key):
     return groq_chat("You are a helpful assistant.", query, groq_key)
 
-# ─── UI ─────────────────────────────────────────────
+# ─── UI ─────────────────────────────
 
 def main():
     st.set_page_config(page_title="RAG App", layout="wide")
@@ -154,65 +159,59 @@ def main():
 
     nvidia = st.text_input("NVIDIA Key", type="password")
     groq = st.text_input("Groq Key", type="password")
-    db = st.text_input("DB URL", value="duckdb:///raglite.duckdb")
 
     if st.sidebar.button("Init"):
-        if not (nvidia and groq):
-            st.error("Keys required")
-        else:
-            st.session_state.config = build_config(nvidia, groq, db)
-            st.session_state.groq_key = groq
-            st.success("Ready")
+        st.session_state.config = build_config(nvidia, groq, get_db_url())
+        st.session_state.groq = groq
+        st.success("Ready")
 
     if not st.session_state.config:
         st.info("Configure first")
         return
 
-    files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+    files = st.file_uploader("Upload PDF", type=["pdf"], accept_multiple_files=True)
 
     if files:
         for f in files:
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp.write(f.read())
-                tmp_path = tmp.name
+                path = tmp.name
 
-            success = process_document(tmp_path, st.session_state.config)
+            success = process_document(path, st.session_state.config)
 
             if success:
                 st.success(f"Indexed: {f.name}")
                 st.session_state.docs = True
             else:
-                st.error(f"Failed to index: {f.name}")
+                st.error(f"Failed: {f.name}")
 
-            os.remove(tmp_path)
+            os.remove(path)
 
     if not st.session_state.docs:
-        st.info("Upload documents")
+        st.info("Upload document")
         return
 
     for u, a in st.session_state.chat:
         st.chat_message("user").write(u)
         st.chat_message("assistant").write(a)
 
-    q = st.chat_input("Ask...")
+    q = st.chat_input("Ask question")
+
     if q:
         st.chat_message("user").write(q)
-
-        groq_key = st.session_state.get("groq_key", groq)
 
         spans = search_and_rerank(q, st.session_state.config)
         st.write("DEBUG spans:", spans)
 
         if spans:
-            st.success("✅ Answer from DOCUMENT (RAG)")
-            ans = generate_answer(q, spans, st.session_state.chat, groq_key)
+            st.success("RAG Answer")
+            ans = generate_answer(q, spans, st.session_state.chat, st.session_state.groq)
         else:
-            st.warning("⚠️ Answer from GROQ (No document context)")
-            ans = fallback_answer(q, groq_key)
+            st.warning("Fallback (Groq)")
+            ans = fallback_answer(q, st.session_state.groq)
 
         st.chat_message("assistant").write(ans)
         st.session_state.chat.append((q, ans))
-
 
 if __name__ == "__main__":
     main()
