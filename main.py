@@ -1,223 +1,294 @@
+"""
+RAG App with Hybrid Search
+- Embeddings : NVIDIA llama-3.2-nv-embedqa-1b-v2  (via LiteLLM openai/ prefix)
+- Reranking  : NVIDIA llama-3.2-nv-rerankqa-1b-v2 (direct HTTP wrapper)
+- LLM        : Groq  llama3-70b-8192
+- Database   : PostgreSQL (Neon) or DuckDB (local fallback)
+- RAGLite    : pinned to 1.0.0 — uses Document / insert_documents API
+"""
+
 import os
 import logging
-import streamlit as st
-from raglite import RAGLiteConfig, insert_document, hybrid_search, retrieve_chunks, rerank_chunks, rag
-from rerankers import Reranker
-from typing import List
-from pathlib import Path
-import anthropic
-import time
+import tempfile
 import warnings
+from pathlib import Path
+from typing import List
 
-import spacy
+import streamlit as st
+from dotenv import load_dotenv
 
-try:
-    spacy.load("xx_sent_ud_sm")
-except:
-    import os
-    os.system("python -m spacy download xx_sent_ud_sm")
-
+load_dotenv()
+warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-warnings.filterwarnings("ignore", message=".*torch.classes.*")
+
+# ─── RAG system prompt ───────────────────────────────────────────────────────
 
 RAG_SYSTEM_PROMPT = """
 You are a friendly and knowledgeable assistant that provides complete and insightful answers.
 Answer the user's question using only the context below.
 When responding, you MUST NOT reference the existence of the context, directly or indirectly.
-Instead, you MUST treat the context as if its contents are entirely part of your working memory.
+Instead, treat the context as if its contents are entirely part of your working memory.
 """.strip()
 
-def initialize_config(openai_key: str, anthropic_key: str, cohere_key: str, db_url: str) -> RAGLiteConfig:
-    """Initializes and returns a RAGLiteConfig object with the specified API keys and database URL.
+# ─── Secrets ─────────────────────────────────────────────────────────────────
 
-    This function sets the provided API keys in the environment variables and returns a 
-    RAGLiteConfig object configured with the given database URL and pre-defined settings for 
-    language model, embedder, and reranker.
-
-    Args:
-        openai_key (str): The API key for OpenAI services.
-        anthropic_key (str): The API key for Anthropic services.
-        cohere_key (str): The API key for Cohere services.
-        db_url (str): The database URL for connecting to the desired data source.
-
-    Returns:
-        RAGLiteConfig: A configuration object initialized with the specified parameters.
-
-    Raises:
-        ValueError: If there is an issue setting up the configuration, an error is raised with details."""
+def get_secret(key: str, default: str = "") -> str:
     try:
-        os.environ["OPENAI_API_KEY"] = openai_key
-        os.environ["ANTHROPIC_API_KEY"] = anthropic_key
-        os.environ["COHERE_API_KEY"] = cohere_key
-        
-        return RAGLiteConfig(
-            db_url=db_url,
-            llm="claude-3-opus-20240229",
-            embedder="text-embedding-3-large",
-            embedder_normalize=True,
-            chunk_max_size=2000,
-            embedder_sentence_window_size=2,
-            reranker=Reranker("cohere", api_key=cohere_key, lang="en")
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key, default)
+
+
+def get_db_url() -> str:
+    url = get_secret("DATABASE_URL")
+    if not url:
+        return "duckdb:///raglite.duckdb"
+    if url.startswith("postgresql") and "sslmode" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode=require"
+    return url
+
+# ─── NVIDIA Reranker ─────────────────────────────────────────────────────────
+
+class NvidiaReranker:
+    """
+    RAGLite calls reranker.rank(query, docs) where docs is a list[str].
+    We return a list of original indices sorted by relevance (most relevant first).
+    """
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def rank(self, query: str, docs: List[str], **_):
+        import requests
+        resp = requests.post(
+            "https://integrate.api.nvidia.com/v1/ranking",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "nvidia/llama-3.2-nv-rerankqa-1b-v2",
+                "query":    {"role": "user", "content": query},
+                "passages": [{"role": "user", "content": d} for d in docs],
+            },
+            timeout=60,
         )
-    except Exception as e:
-        raise ValueError(f"Configuration error: {e}")
+        resp.raise_for_status()
+        rankings = resp.json().get("rankings", [])
+        return [r["index"] for r in sorted(rankings, key=lambda x: x.get("logit", 0), reverse=True)]
 
-def process_document(file_path: str) -> bool:
-    """Processes a document by inserting it into a system with a given configuration.
+# ─── Groq LLM ────────────────────────────────────────────────────────────────
 
-    This function checks if a configuration is initialized in the session state.
-    If the configuration is present, it attempts to insert the document located
-    at the given file path using this configuration.
+def groq_chat(system: str, user: str, groq_key: str) -> str:
+    from groq import Groq
+    resp = Groq(api_key=groq_key).chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role": "system", "content": system},
+                  {"role": "user",   "content": user}],
+        max_tokens=1024,
+        temperature=0.7,
+    )
+    return resp.choices[0].message.content
 
-    Args:
-        file_path (str): The path to the document to be processed.
+# ─── RAGLite config ──────────────────────────────────────────────────────────
 
-    Returns:
-        bool: True if the document was successfully processed; False otherwise."""
+def build_config(nvidia_key: str, groq_key: str, db_url: str):
+    from raglite import RAGLiteConfig
+
+    os.environ["GROQ_API_KEY"]   = groq_key
+    os.environ["NVIDIA_API_KEY"] = nvidia_key
+    # LiteLLM routes "openai/<model>" to OPENAI_BASE_URL using OPENAI_API_KEY
+    os.environ["OPENAI_API_KEY"]  = nvidia_key
+    os.environ["OPENAI_BASE_URL"] = "https://integrate.api.nvidia.com/v1"
+
+    return RAGLiteConfig(
+        db_url=db_url,
+        llm="groq/llama3-70b-8192",
+        embedder="openai/nvidia/llama-3.2-nv-embedqa-1b-v2",
+        embedder_normalize=True,
+        reranker=NvidiaReranker(api_key=nvidia_key),
+    )
+
+# ─── Document ingestion (raglite 1.0.0 API) ──────────────────────────────────
+
+def process_document(file_path: str, config) -> bool:
     try:
-        if not st.session_state.get('my_config'):
-            raise ValueError("Configuration not initialized")
-        insert_document(Path(file_path), config=st.session_state.my_config)
+        from raglite import Document, insert_documents
+        doc = Document.from_path(Path(file_path))
+        insert_documents([doc], config=config)
         return True
     except Exception as e:
-        logger.error(f"Error processing document: {str(e)}")
+        logger.error(f"insert_documents error: {e}", exc_info=True)
         return False
 
-def perform_search(query: str) -> List[dict]:
-    """Conducts a hybrid search and returns a list of ranked chunks based on the query.
+# ─── Search → rerank → retrieve (raglite 1.0.0 API) ─────────────────────────
 
-    This function performs a search using a hybrid search method, retrieves the relevant 
-    chunks, and reranks them according to the query. It handles any exceptions that occur 
-    during the process and logs the errors.
-
-    Args:
-        query (str): The search query string.
-
-    Returns:
-        List[dict]: A list of dictionaries representing the ranked chunks. Returns an 
-        empty list if no results are found or if an error occurs."""
+def search_and_rerank(query: str, config) -> List:
+    """
+    Returns a list of chunk spans (each is a list of consecutive Chunk objects).
+    Falls back to [] on error.
+    """
     try:
-        chunk_ids, scores = hybrid_search(query, num_results=10, config=st.session_state.my_config)
+        from raglite import hybrid_search, rerank_chunks, retrieve_context
+        chunk_ids, _ = hybrid_search(query, num_results=20, config=config)
         if not chunk_ids:
             return []
-        chunks = retrieve_chunks(chunk_ids, config=st.session_state.my_config)
-        return rerank_chunks(query, chunks, config=st.session_state.my_config)
+        ranked_chunks = rerank_chunks(query, chunk_ids, config=config)
+        # retrieve_context groups top chunks into coherent spans
+        return retrieve_context(ranked_chunks[:5], config=config)
     except Exception as e:
-        logger.error(f"Search error: {str(e)}")
+        logger.error(f"search_and_rerank error: {e}", exc_info=True)
         return []
 
-def handle_fallback(query: str) -> str:
+# ─── Answer generation ───────────────────────────────────────────────────────
+
+def generate_answer(query: str, chunk_spans: List, history: List, groq_key: str) -> str:
+    parts = []
+    for span in chunk_spans:
+        # Each span is a list of Chunk objects; concatenate their text
+        span_text = " ".join(
+            getattr(c, "text", None) or getattr(c, "content", str(c))
+            for c in (span if isinstance(span, list) else [span])
+        ).strip()
+        if span_text:
+            parts.append(span_text)
+
+    context = "\n\n---\n\n".join(parts)
+    system  = f"{RAG_SYSTEM_PROMPT}\n\nContext:\n{context}"
+    hist    = "".join(f"User: {u}\nAssistant: {a}\n\n" for u, a in history[-4:])
+    return groq_chat(system, f"{hist}User: {query}", groq_key)
+
+
+def fallback_answer(query: str, groq_key: str) -> str:
     try:
-        client = anthropic.Anthropic(api_key=st.session_state.user_env["ANTHROPIC_API_KEY"])
-        system_prompt = """You are a helpful AI assistant. When you don't know something, 
-        be honest about it. Provide clear, concise, and accurate responses. If the question 
-        is not related to any specific document, use your general knowledge to answer."""
-        
-        message = client.messages.create(
-            model="claude-3-sonnet-20240229",
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": query}],
-            temperature=0.7
+        return groq_chat(
+            "You are a helpful AI assistant. Be clear, concise, and honest.",
+            query, groq_key,
         )
-        return message.content[0].text
     except Exception as e:
-        logger.error(f"Fallback error: {str(e)}")
-        st.error(f"Fallback error: {str(e)}")  # Show error in UI
-        return "I apologize, but I encountered an error while processing your request. Please try again."
+        logger.error(f"fallback error: {e}")
+        return "I encountered an error. Please try again."
+
+# ─── Streamlit UI ────────────────────────────────────────────────────────────
 
 def main():
-    st.set_page_config(page_title="LLM-Powered Hybrid Search-RAG Assistant", layout="wide")
-    
-    for state_var in ['chat_history', 'documents_loaded', 'my_config', 'user_env']:
-        if state_var not in st.session_state:
-            st.session_state[state_var] = [] if state_var == 'chat_history' else False if state_var == 'documents_loaded' else None if state_var == 'my_config' else {}
+    st.set_page_config(page_title="RAG App – Hybrid Search", layout="wide")
 
+    for k, v in [("chat_history", []), ("documents_loaded", False),
+                 ("my_config", None), ("groq_key", "")]:
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.title("Configuration")
-        openai_key = st.text_input("OpenAI API Key", value=st.session_state.get('openai_key', ''), type="password", placeholder="sk-...")
-        anthropic_key = st.text_input("Anthropic API Key", value=st.session_state.get('anthropic_key', ''), type="password", placeholder="sk-ant-...")
-        cohere_key = st.text_input("Cohere API Key", value=st.session_state.get('cohere_key', ''), type="password", placeholder="Enter Cohere key")
-        db_url = st.text_input("Database URL", value=st.session_state.get('db_url', 'sqlite:///raglite.sqlite'), placeholder="sqlite:///raglite.sqlite")
-        
-        if st.button("Save Configuration"):
-            try:
-                if not all([openai_key, anthropic_key, cohere_key, db_url]):
-                    st.error("All fields are required!")
-                    return
-                
-                for key, value in {'openai_key': openai_key, 'anthropic_key': anthropic_key, 'cohere_key': cohere_key, 'db_url': db_url}.items():
-                    st.session_state[key] = value
-                
-                st.session_state.my_config = initialize_config(openai_key=openai_key, anthropic_key=anthropic_key, cohere_key=cohere_key, db_url=db_url)
-                st.session_state.user_env = {"ANTHROPIC_API_KEY": anthropic_key}
-                st.success("Configuration saved successfully!")
-            except Exception as e:
-                st.error(f"Configuration error: {str(e)}")
+        st.title("⚙️ Configuration")
+        st.caption("Keys loaded from **st.secrets** (Cloud) or `.env` (local).")
 
+        nvidia_key = get_secret("NVIDIA_API_KEY")
+        groq_key   = get_secret("GROQ_API_KEY")
+        db_url     = get_db_url()
+
+        with st.expander("🔑 Override keys (optional)"):
+            nvidia_key = st.text_input("NVIDIA API Key", value=nvidia_key,
+                                       type="password", placeholder="nvapi-...")
+            groq_key   = st.text_input("Groq API Key",   value=groq_key,
+                                       type="password", placeholder="gsk_...")
+            db_url     = st.text_input("Database URL",   value=db_url)
+
+        if st.button("💾 Save & Initialise", use_container_width=True):
+            if not all([nvidia_key, groq_key, db_url]):
+                st.error("All three fields are required.")
+            else:
+                with st.spinner("Initialising…"):
+                    try:
+                        st.session_state.my_config = build_config(nvidia_key, groq_key, db_url)
+                        st.session_state.groq_key  = groq_key
+                        st.success("✅ Ready!")
+                    except Exception as e:
+                        st.error(f"Config error: {e}")
+                        logger.exception("Config error")
+
+        st.divider()
+        st.markdown("**Models in use**")
+        st.markdown("🔵 Embeddings — `llama-3.2-nv-embedqa-1b-v2`")
+        st.markdown("🟣 Reranker   — `llama-3.2-nv-rerankqa-1b-v2`")
+        st.markdown("🟢 LLM        — `llama3-70b-8192` via Groq")
+
+    # ── Main ─────────────────────────────────────────────────────────────────
     st.title("👀 RAG App with Hybrid Search")
 
-    if st.session_state.my_config:
-        uploaded_files = st.file_uploader("Upload PDF documents", type=["pdf"], accept_multiple_files=True, key="pdf_uploader")
+    if not st.session_state.my_config:
+        st.info("👈 Enter your API keys in the sidebar and click **Save & Initialise**.")
+        return
 
-        if uploaded_files:
-            success = False
-            for uploaded_file in uploaded_files:
-                with st.spinner(f"Processing {uploaded_file.name}..."):
-                    temp_path = f"temp_{uploaded_file.name}"
-                    with open(temp_path, "wb") as f:
-                        f.write(uploaded_file.getvalue())
-                    
-                    if process_document(temp_path):
-                        st.success(f"Successfully processed: {uploaded_file.name}")
-                        success = True
-                    else:
-                        st.error(f"Failed to process: {uploaded_file.name}")
-                    os.remove(temp_path)
-            
-            if success:
-                st.session_state.documents_loaded = True
-                st.success("Documents are ready! You can now ask questions about them.")
+    st.subheader("📄 Upload Documents")
+    uploaded_files = st.file_uploader(
+        "Upload PDF documents", type=["pdf"],
+        accept_multiple_files=True, key="pdf_uploader",
+    )
 
-    if st.session_state.documents_loaded:
-        for msg in st.session_state.chat_history:
-            with st.chat_message("user"): st.write(msg[0])
-            with st.chat_message("assistant"): st.write(msg[1])
-
-        user_input = st.chat_input("Ask a question about the documents...")
-        if user_input:
-            with st.chat_message("user"): st.write(user_input)
-            with st.chat_message("assistant"):
-                message_placeholder = st.empty()
+    if uploaded_files:
+        for uf in uploaded_files:
+            with st.spinner(f"Processing **{uf.name}**…"):
+                tmp_path = None
                 try:
-                    reranked_chunks = perform_search(query=user_input)
-                    if not reranked_chunks or len(reranked_chunks) == 0:
-                        logger.info("No relevant documents found. Falling back to Claude.")
-                        st.info("No relevant documents found. Using general knowledge to answer.")
-                        full_response = handle_fallback(user_input)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(uf.getvalue())
+                        tmp_path = tmp.name
+                    if process_document(tmp_path, st.session_state.my_config):
+                        st.success(f"✅ {uf.name}")
+                        st.session_state.documents_loaded = True
                     else:
-                        formatted_messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": msg}
-                                           for i, msg in enumerate([m for pair in st.session_state.chat_history for m in pair]) if msg]
-                        
-                        response_stream = rag(prompt=user_input, 
-                                           system_prompt=RAG_SYSTEM_PROMPT,
-                                           search=hybrid_search, 
-                                           messages=formatted_messages,
-                                           max_contexts=5, 
-                                           config=st.session_state.my_config)
-                        
-                        full_response = ""
-                        for chunk in response_stream:
-                            full_response += chunk
-                            message_placeholder.markdown(full_response + "▌")
-                    
-                    message_placeholder.markdown(full_response)
-                    st.session_state.chat_history.append((user_input, full_response))
+                        st.error(f"❌ Failed: {uf.name} — check Streamlit logs for details")
                 except Exception as e:
-                    st.error(f"Error: {str(e)}")
-    else:
-        st.info("Please configure your API keys and upload documents to get started." if not st.session_state.my_config else "Please upload some documents to get started.")
+                    st.error(f"❌ {uf.name}: {e}")
+                    logger.exception(f"Upload error: {uf.name}")
+                finally:
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+
+        if st.session_state.documents_loaded:
+            st.success("Documents indexed — ask away below 👇")
+
+    if not st.session_state.documents_loaded:
+        st.info("Upload at least one PDF document to enable the chat.")
+        return
+
+    st.divider()
+    st.subheader("💬 Chat")
+
+    for u, a in st.session_state.chat_history:
+        with st.chat_message("user"):      st.write(u)
+        with st.chat_message("assistant"): st.write(a)
+
+    user_input = st.chat_input("Ask a question about your documents…")
+    if not user_input:
+        return
+
+    with st.chat_message("user"):
+        st.write(user_input)
+
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        with st.spinner("Thinking…"):
+            try:
+                groq_key   = st.session_state.groq_key or get_secret("GROQ_API_KEY")
+                chunk_spans = search_and_rerank(user_input, st.session_state.my_config)
+                if chunk_spans:
+                    response = generate_answer(
+                        user_input, chunk_spans,
+                        st.session_state.chat_history, groq_key,
+                    )
+                else:
+                    st.info("No relevant document context found — using general knowledge.")
+                    response = fallback_answer(user_input, groq_key)
+                placeholder.markdown(response)
+                st.session_state.chat_history.append((user_input, response))
+            except Exception as e:
+                st.error(f"Error: {e}")
+                logger.exception("Chat error")
+
 
 if __name__ == "__main__":
     main()
