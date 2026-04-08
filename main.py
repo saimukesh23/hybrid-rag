@@ -71,7 +71,7 @@ def groq_chat(system: str, user: str, groq_key: str) -> str:
     from groq import Groq
     try:
         resp = Groq(api_key=groq_key).chat.completions.create(
-            model="llama-3.3-70b-versatile",  # ✅ FIXED
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
@@ -94,8 +94,8 @@ def build_config(nvidia_key: str, groq_key: str, db_url: str):
 
     return RAGLiteConfig(
         db_url=db_url,
-        llm="groq/llama-3.3-70b-versatile",  # ✅ FIXED
-        embedder="nvidia/llama-3.2-nv-embedqa-1b-v2",  # ✅ FIXED
+        llm="groq/llama-3.3-70b-versatile",
+        embedder="nvidia/llama-3.2-nv-embedqa-1b-v2",
         embedder_normalize=True,
         reranker=NvidiaReranker(api_key=nvidia_key),
     )
@@ -174,9 +174,17 @@ def main():
         for f in files:
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp.write(f.read())
-                process_document(tmp.name, st.session_state.config)
-                os.remove(tmp.name)
-        st.session_state.docs = True
+                tmp_path = tmp.name
+
+            success = process_document(tmp_path, st.session_state.config)
+
+            if success:
+                st.success(f"Indexed: {f.name}")
+                st.session_state.docs = True
+            else:
+                st.error(f"Failed to index: {f.name}")
+
+            os.remove(tmp_path)
 
     if not st.session_state.docs:
         st.info("Upload documents")
@@ -193,10 +201,13 @@ def main():
         groq_key = st.session_state.get("groq_key", groq)
 
         spans = search_and_rerank(q, st.session_state.config)
+        st.write("DEBUG spans:", spans)
 
         if spans:
+            st.success("✅ Answer from DOCUMENT (RAG)")
             ans = generate_answer(q, spans, st.session_state.chat, groq_key)
         else:
+            st.warning("⚠️ Answer from GROQ (No document context)")
             ans = fallback_answer(q, groq_key)
 
         st.chat_message("assistant").write(ans)
