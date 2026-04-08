@@ -22,11 +22,9 @@ Do not hallucinate.
 def get_secret(key):
     return st.secrets.get(key, "")
 
+# ✅ FIXED: FORCE DUCKDB (no Neon)
 def get_db_url():
-    url = get_secret("DATABASE_URL")
-    if url.startswith("postgresql") and "sslmode" not in url:
-        url += "?sslmode=require"
-    return url
+    return "duckdb:///raglite.duckdb"
 
 # ─── NVIDIA RERANK ─────────────────
 
@@ -97,6 +95,7 @@ def process_document(path, config):
         text = "".join(p.extract_text() or "" for p in reader.pages)
 
         if not text.strip():
+            logger.error("No text extracted")
             return False
 
         doc = Document(content=text)
@@ -138,6 +137,8 @@ def main():
             else:
                 st.error(f"Failed: {f.name}")
 
+            os.remove(path)
+
     q = st.chat_input("Ask")
 
     if q:
@@ -150,10 +151,10 @@ def main():
                 for span in spans
             )
             ans = groq_chat(RAG_SYSTEM_PROMPT + context, q, groq_key)
-            st.success("RAG")
+            st.success("✅ RAG (from document)")
         else:
             ans = groq_chat("General answer", q, groq_key)
-            st.warning("Fallback")
+            st.warning("⚠️ Fallback (no document)")
 
         st.write(ans)
 
