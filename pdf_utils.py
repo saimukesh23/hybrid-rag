@@ -54,8 +54,8 @@ def clean_text(text: str) -> str:
 
 def chunk_text_by_tokens(
     text: str,
-    chunk_size: int = 400,
-    overlap: int = 50,
+    chunk_size: int = 150,
+    overlap: int = 30,
     encoding_name: str = "cl100k_base"
 ) -> List[str]:
     """
