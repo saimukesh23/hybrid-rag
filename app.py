@@ -77,7 +77,7 @@ if uploaded_files:
                         temp_paths.append(tmp_file.name)
                 
                 # Load and chunk PDFs
-                documents = load_and_chunk_pdfs(temp_paths, chunk_size=400, overlap=50)
+                documents = load_and_chunk_pdfs(temp_paths, chunk_size=150, overlap=30)
                 
                 # Clean up temp files
                 for path in temp_paths:
@@ -108,7 +108,7 @@ if uploaded_files:
                 retriever = HybridRetriever(
                     embedding_manager=embedding_manager,
                     documents=documents,
-                    top_k=5
+                    top_k=7
                 )
                 st.session_state.retriever = retriever
                 
