@@ -1,0 +1,16 @@
+---
+
+## **File 6: requirements.txt**
+Action: file_editor view /app/requirements.txt
+Observation: [Showing lines 1-10 of 10 total] /app/requirements.txt:
+1|streamlit
+2|PyPDF2
+3|sentence-transformers
+4|faiss-cpu
+5|groq
+6|qdrant-client
+7|rank-bm25
+8|tiktoken
+9|numpy<2.0.0
+10|
+[End of file]
