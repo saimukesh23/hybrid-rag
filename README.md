@@ -7,12 +7,15 @@
 5. **Check Sources**: Expand "View relevant chunks" to see source passages
 
 ## 🏗️ Architecture
-├── app.py # Main Streamlit application
-├── pdf_utils.py # PDF loading and chunking (400 tokens, 50 overlap)
-├── embeddings.py # Embedding generation and indexing (FAISS + Qdrant)
-├── retrieval.py # Hybrid search (FAISS + BM25 + RRF)
-├── qa.py # Groq API integration with streaming
-└── requirements.txt # Python dependencies
+
+```
+app.py              # Main Streamlit application
+pdf_utils.py        # PDF loading and chunking (400 tokens, 50 overlap)
+embeddings.py       # Embedding generation and indexing (FAISS + Qdrant)
+retrieval.py        # Hybrid search (FAISS + BM25 + RRF)
+qa.py               # Groq API integration with streaming
+requirements.txt    # Python dependencies
+```
 
 ### How It Works
 
