@@ -12,7 +12,7 @@ class QASystem:
         groq_api_key: str,
         retriever,
         model: str = "llama-3.3-70b-versatile",
-        similarity_threshold: float = 0.3
+        similarity_threshold: float = 0.01
     ):
         """
         Initialize QA system.
