@@ -10,7 +10,7 @@
 
 ```
 app.py              # Main Streamlit application
-pdf_utils.py        # PDF loading and chunking (400 tokens, 50 overlap)
+pdf_utils.py        # PDF loading and chunking (150 tokens, 30 overlap)
 embeddings.py       # Embedding generation and indexing (FAISS + Qdrant)
 retrieval.py        # Hybrid search (FAISS + BM25 + RRF)
 qa.py               # Groq API integration with streaming
@@ -19,7 +19,7 @@ requirements.txt    # Python dependencies
 
 ### How It Works
 
-1. **PDF Processing**: PDFs are loaded and split into 400-token chunks with 50-token overlap using tiktoken
+1. **PDF Processing**: PDFs are loaded and split into 150-token chunks with 30-token overlap using tiktoken
 2. **Embedding Generation**: Each chunk is embedded using `all-MiniLM-L6-v2`
 3. **Indexing**: 
    - FAISS: In-memory vector index for semantic search
@@ -27,21 +27,21 @@ requirements.txt    # Python dependencies
    - Qdrant (optional): Persistent vector storage
 4. **Query Processing**:
    - Semantic search via FAISS (cosine similarity)
-   - Keyword search via BM25
-   - Results combined using Reciprocal Rank Fusion
+   - Keyword search via BM25 (zero-score results excluded)
+   - Results combined using Reciprocal Rank Fusion (RRF)
 5. **Answer Generation**:
-   - Top 5 chunks passed to Groq LLM
+   - Top 7 chunks passed to Groq LLM
    - Streaming response with conversation history
-   - Fallback for low-confidence results
+   - Fallback for low-confidence results (threshold: 0.01)
 
 ## 🎛️ Configuration
 
 You can customize these parameters in the code:
 
-- **Chunk size**: 400 tokens (in `pdf_utils.py`)
-- **Chunk overlap**: 50 tokens (in `pdf_utils.py`)
-- **Top-K results**: 5 (in `app.py`)
-- **Similarity threshold**: 0.3 (in `qa.py`)
+- **Chunk size**: 150 tokens (in `pdf_utils.py`)
+- **Chunk overlap**: 30 tokens (in `pdf_utils.py`)
+- **Top-K results**: 7 (in `app.py`)
+- **Similarity threshold**: 0.01 (in `qa.py`) — tuned for RRF score range
 - **Groq model**: llama-3.3-70b-versatile (in `qa.py`)
 - **Temperature**: 0.3 (in `qa.py`)
 - **Max tokens**: 1024 (in `qa.py`)
