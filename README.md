@@ -1,8 +1,4 @@
 
-Action: file_editor view /app/README.md
-Observation: [Showing lines 101-186 of 186 total] /app/README.md:
-101|## 📖 Usage
-102|
 103|1. **Upload PDFs**: Use the sidebar to upload one or more PDF files
 104|2. **Wait for Processing**: The app will chunk and index your documents
 105|3. **Ask Questions**: Type your question in the chat input
@@ -85,6 +81,4 @@ Observation: [Showing lines 101-186 of 186 total] /app/README.md:
 182|
 183|---
 184|
-185|**Ready to deploy!** This app is production-ready and optimized for Streamlit Cloud. 🚀
-186|
-[End of file]
+185|**Ready to deploy!** This app is production-ready and optimized for Streamlit Cloud. 
