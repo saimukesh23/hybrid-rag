@@ -77,7 +77,7 @@ class HybridRetriever:
         # Return results
         results = []
         for idx in top_indices:
-            if idx < len(self.documents):
+            if idx < len(self.documents) and scores[idx] > 0:
                 results.append((self.documents[idx]['text'], float(scores[idx])))
         
         return results
